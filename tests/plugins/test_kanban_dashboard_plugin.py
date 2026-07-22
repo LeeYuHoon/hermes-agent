@@ -251,6 +251,34 @@ def test_new_board_dialog_collects_project_directory():
     assert "default_workdir: projectDirectory.trim() || undefined" in bundle
 
 
+def test_dashboard_task_delete_requests_include_selected_board():
+    """Single and bulk deletes must target the board shown in this tab."""
+    bundle = (
+        Path(__file__).resolve().parents[2]
+        / "plugins"
+        / "kanban"
+        / "dashboard"
+        / "dist"
+        / "index.js"
+    ).read_text(encoding="utf-8")
+
+    single_delete = bundle[
+        bundle.index("const deleteTask") : bundle.index("const deleteSelected")
+    ]
+    bulk_delete = bundle[
+        bundle.index("const deleteSelected") : bundle.index("// --- render")
+    ]
+    assert (
+        "SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, board), {"
+        in single_delete
+    )
+    assert (
+        "SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(id)}`, board), "
+        '{ method: "DELETE" })'
+        in bulk_delete
+    )
+
+
 def test_dashboard_workspace_picker_explains_persistence_contract():
     """Task creation must make scratch deletion visible without a hover."""
     bundle = (
