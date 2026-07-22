@@ -137,6 +137,34 @@ def test_patch_board_sets_project_directory(client, tmp_path):
     )
 
 
+def test_dashboard_task_delete_requests_include_selected_board():
+    """Single and bulk deletes must target the board shown in this tab."""
+    bundle = (
+        Path(__file__).resolve().parents[2]
+        / "plugins"
+        / "kanban"
+        / "dashboard"
+        / "dist"
+        / "index.js"
+    ).read_text(encoding="utf-8")
+
+    single_delete = bundle[
+        bundle.index("const deleteTask") : bundle.index("const deleteSelected")
+    ]
+    bulk_delete = bundle[
+        bundle.index("const deleteSelected") : bundle.index("// --- render")
+    ]
+    assert (
+        "SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, board), {"
+        in single_delete
+    )
+    assert (
+        "SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(id)}`, board), "
+        '{ method: "DELETE" })'
+        in bulk_delete
+    )
+
+
 def test_scheduled_tasks_have_their_own_column_not_todo(client):
     """Scheduled/time-delay tasks must not be silently bucketed into todo."""
 

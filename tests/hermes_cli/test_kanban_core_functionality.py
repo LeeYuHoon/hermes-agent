@@ -242,6 +242,41 @@ def test_read_worker_log_tail(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+def test_cli_delete_removes_archived_task(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="gone")
+        assert kb.archive_task(conn, tid)
+    finally:
+        conn.close()
+
+    out = run_slash(f"delete {tid}")
+
+    assert f"Deleted {tid}" in out
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid) is None
+    finally:
+        conn.close()
+
+
+def test_cli_delete_removes_live_task(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="delete-directly")
+    finally:
+        conn.close()
+
+    out = run_slash(f"delete {tid}")
+
+    assert f"Deleted {tid}" in out
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid) is None
+    finally:
+        conn.close()
+
+
 
 # ---------------------------------------------------------------------------
 # CLI stats / watch / log / notify / daemon parity
