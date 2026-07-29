@@ -238,6 +238,39 @@ def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
     return DEFAULT_CLAIM_TTL_SECONDS
 
 
+# Orphan window for external observation cards. An observation card has no
+# worker, no claim, and no heartbeat — the only liveness signal is the
+# external adapter eventually calling ``complete``. If that never happens
+# (adapter crash, killed terminal), the card would sit in ``running``
+# forever, so after this window ``expire_orphan_observations`` closes it as
+# ``done`` (never ``ready``) with an ``observation_expired`` audit event.
+# 24h comfortably outlives any real Claude Code / Codex turn.
+DEFAULT_OBSERVATION_TTL_SECONDS = 24 * 60 * 60
+
+
+def _resolve_observation_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
+    """Effective orphan-observation TTL, honoring the kanban env override.
+
+    Mirrors ``_resolve_claim_ttl_seconds``: explicit call-site values win,
+    then a positive integer from ``HERMES_KANBAN_OBSERVATION_TTL_SECONDS``,
+    then the built-in default. Invalid or non-positive values fall back
+    silently — an observation card can never opt into an infinite TTL.
+    """
+    if ttl_seconds is not None:
+        return max(1, int(ttl_seconds))
+
+    raw = os.environ.get("HERMES_KANBAN_OBSERVATION_TTL_SECONDS", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = 0
+        if parsed > 0:
+            return parsed
+
+    return DEFAULT_OBSERVATION_TTL_SECONDS
+
+
 # Grace period after a task transitions to ``running`` during which
 # ``detect_crashed_workers`` skips the ``_pid_alive`` check. Covers the
 # fork() → /proc-visibility window where liveness can transiently report
@@ -949,6 +982,9 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # External observation card. See the column comment in SCHEMA_SQL:
+    # born running with no claim machinery, never dispatchable.
+    observation: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1037,6 +1073,11 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            observation=(
+                bool(row["observation"])
+                if "observation" in keys and row["observation"]
+                else False
             ),
         )
 
@@ -1220,7 +1261,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- External observation card (``create --observation``): mirrors a turn
+    -- executed by an outside agent (Claude Code / Codex adapters). Born
+    -- ``running`` with ``started_at`` set and NO claim machinery or
+    -- ``task_runs`` row. Never dispatchable: every recovery path filters on
+    -- ``observation = 0`` and worker-lifecycle mutations (claim / reclaim /
+    -- assign / promote / unblock) refuse it. Closed by an explicit complete
+    -- or by ``expire_orphan_observations`` (→ ``done``, never ``ready``).
+    observation          INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2413,6 +2462,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "observation" not in cols:
+        # External observation card marker. Existing rows get 0 (normal
+        # worker task), which preserves the behaviour they had before the
+        # column existed.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "observation",
+            "observation INTEGER NOT NULL DEFAULT 0",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2478,7 +2538,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
                 "       max_runtime_seconds, last_heartbeat_at, started_at "
                 "FROM tasks "
-                "WHERE status = 'running' AND current_run_id IS NULL"
+                "WHERE status = 'running' AND current_run_id IS NULL "
+                # Observation cards are running-by-design with no run row;
+                # synthesizing one would hand them to the claim machinery.
+                "  AND observation = 0"
             ).fetchall()
             for row in inflight:
                 started = row["started_at"] or int(time.time())
@@ -2844,6 +2907,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    observation: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2883,6 +2947,34 @@ def create_task(
     provider_override = (provider_override or "").strip() or None
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
+    if observation:
+        # An observation card mirrors work executed by an external agent, so
+        # every option that only means something for a dispatched worker is
+        # a caller bug — refuse instead of silently ignoring it. Routing /
+        # audit options (assignee, tenant, created_by, idempotency_key,
+        # priority, body, session_id, board) stay allowed.
+        rejected = [
+            ("parents", tuple(p for p in parents if p)),
+            ("triage", triage),
+            ("initial_status", initial_status != "running"),
+            ("goal_mode", goal_mode),
+            ("goal_max_turns", goal_max_turns),
+            ("max_retries", max_retries),
+            ("max_runtime_seconds", max_runtime_seconds),
+            ("skills", skills),
+            ("model_override", model_override),
+            ("provider_override", provider_override),
+            ("project_id", project_id),
+            ("workspace_kind", workspace_kind != "scratch"),
+            ("workspace_path", workspace_path),
+            ("branch_name", branch_name),
+        ]
+        offending = [name for name, value in rejected if value]
+        if offending:
+            raise ValueError(
+                "observation cards cannot combine with worker execution "
+                "options: " + ", ".join(offending)
+            )
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -3081,7 +3173,11 @@ def create_task(
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
-                if initial_status == "blocked":
+                if observation:
+                    # Born running: the external agent is already mid-turn.
+                    # Execution-option combos were rejected before the txn.
+                    task_status = "running"
+                elif initial_status == "blocked":
                     task_status = "blocked"
                     if parents:
                         missing = _find_missing_parents(conn, parents)
@@ -3132,12 +3228,13 @@ def create_task(
                     """
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
-                        created_by, created_at, workspace_kind, workspace_path,
+                        created_by, created_at, started_at,
+                        workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, observation
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3148,6 +3245,9 @@ def create_task(
                         priority,
                         created_by,
                         now,
+                        # Observation cards start running at creation time;
+                        # normal tasks get started_at on their first claim.
+                        now if observation else None,
                         workspace_kind,
                         workspace_path,
                         branch_name,
@@ -3162,6 +3262,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        1 if observation else 0,
                     ),
                 )
                 for pid in parents:
@@ -3186,6 +3287,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "observation": bool(observation) or None,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -3332,10 +3434,16 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, claim_lock, assignee, observation FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if not row:
             return False
+        if row["observation"]:
+            raise RuntimeError(
+                f"cannot reassign {task_id}: observation cards mirror an "
+                "external agent and are never dispatched to a worker profile"
+            )
         if row["claim_lock"] is not None and row["status"] == "running":
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
@@ -4022,7 +4130,9 @@ def recompute_ready(
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "FROM tasks WHERE status IN ('todo', 'blocked') "
+            # Observation cards must never be auto-promoted into 'ready'.
+            "  AND observation = 0"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
@@ -4092,6 +4202,16 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # Observation cards are never worker tasks — refuse the claim even
+        # if an external writer somehow parked one in 'ready'.
+        obs_row = conn.execute(
+            "SELECT observation FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if obs_row is not None and obs_row["observation"]:
+            _append_event(
+                conn, task_id, "claim_rejected", {"reason": "observation"},
+            )
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4221,6 +4341,16 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # Same observation refusal as claim_task: never turn an external
+        # observation card into a worker run.
+        obs_row = conn.execute(
+            "SELECT observation FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if obs_row is not None and obs_row["observation"]:
+            _append_event(
+                conn, task_id, "claim_rejected", {"reason": "observation"},
+            )
+            return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -4341,7 +4471,7 @@ def release_stale_claims(
         "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
-        "  AND claim_expires < ?",
+        "  AND claim_expires < ? AND observation = 0",
         (now,),
     ).fetchall()
     for row in stale:
@@ -4450,6 +4580,64 @@ def release_stale_claims(
     return reclaimed
 
 
+def expire_orphan_observations(
+    conn: sqlite3.Connection,
+    *,
+    ttl_seconds: Optional[int] = None,
+) -> list[str]:
+    """Close orphaned external observation cards as ``done``.
+
+    An observation card mirrors a turn run by an external agent (Claude
+    Code / Codex adapters). It has no worker PID, no claim, and no
+    heartbeat — the only terminal signal is the adapter's ``complete``.
+    When that never arrives, the card must not linger in ``running``
+    forever, and it must never be handed to the dispatcher: after
+    ``ttl_seconds`` (default :data:`DEFAULT_OBSERVATION_TTL_SECONDS`,
+    env-overridable via ``HERMES_KANBAN_OBSERVATION_TTL_SECONDS``) the
+    card is closed as ``done`` with an abnormal-end ``result`` and an
+    ``observation_expired`` audit event.
+
+    Called from every dispatcher tick and from the CLI ``list`` mini-
+    dispatch, so boards without a dispatcher still get swept. Returns the
+    list of expired task ids.
+    """
+    now = int(time.time())
+    ttl = _resolve_observation_ttl_seconds(ttl_seconds)
+    cutoff = now - ttl
+    expired: list[str] = []
+    orphans = conn.execute(
+        "SELECT id, started_at FROM tasks "
+        "WHERE observation = 1 AND status = 'running' "
+        "  AND started_at IS NOT NULL AND started_at < ?",
+        (cutoff,),
+    ).fetchall()
+    for row in orphans:
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = ?, "
+                "result = ? "
+                "WHERE id = ? AND observation = 1 AND status = 'running'",
+                (
+                    now,
+                    "External observation card expired without a completion "
+                    "signal; the observed agent likely ended abnormally.",
+                    row["id"],
+                ),
+            )
+            if cur.rowcount != 1:
+                continue
+            _append_event(
+                conn, row["id"], "observation_expired",
+                {
+                    "started_at": int(row["started_at"]),
+                    "ttl_seconds": ttl,
+                    "elapsed_seconds": now - int(row["started_at"]),
+                },
+            )
+            expired.append(row["id"])
+    return expired
+
+
 def reclaim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4469,10 +4657,14 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT status, claim_lock, worker_pid, observation FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
+        return False
+    if row["observation"]:
+        # Observation cards have no claim to release; reclaiming would flip
+        # an external card to 'ready' and hand it to the dispatcher.
         return False
     if row["status"] != "running" and row["claim_lock"] is None:
         # Nothing to reclaim — already ready / blocked / done.
@@ -5704,11 +5896,16 @@ def promote_task(
     promotion would succeed without mutating state.
     """
     row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, observation FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
 
+    if row["observation"]:
+        return False, (
+            f"task {task_id} is an observation card; it mirrors an external "
+            f"agent and can never be promoted into the dispatch queue"
+        )
     cur_status = row["status"]
     if cur_status not in ("todo", "blocked"):
         return False, (
@@ -5766,6 +5963,13 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     now = int(time.time())
     with write_txn(conn):
+        obs_row = conn.execute(
+            "SELECT observation FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if obs_row is not None and obs_row["observation"]:
+            # Unblocking would route the card toward 'ready'; observation
+            # cards only ever leave via complete or the orphan TTL sweep.
+            return False
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
@@ -6685,6 +6889,9 @@ class DispatchResult:
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed because no progress (heartbeat) was seen
     within ``dispatch_stale_timeout_seconds``."""
+    observation_expired: list[str] = field(default_factory=list)
+    """External observation cards closed as ``done`` by the orphan TTL
+    sweep (``expire_orphan_observations``). Never re-dispatched."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
@@ -7070,7 +7277,7 @@ def enforce_max_runtime(
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
-        "  AND t.worker_pid IS NOT NULL"
+        "  AND t.worker_pid IS NOT NULL AND t.observation = 0"
     ).fetchall()
     for row in rows:
         lock = row["claim_lock"] or ""
@@ -7202,7 +7409,9 @@ def detect_stale_running(
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running'"
+        # Observation cards never heartbeat (no worker); expiry is handled
+        # by expire_orphan_observations, which closes them as 'done'.
+        "WHERE t.status = 'running' AND t.observation = 0"
     ).fetchall()
 
     for row in rows:
@@ -7413,7 +7622,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "WHERE status = 'running' AND worker_pid IS NOT NULL "
+            "  AND observation = 0"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
@@ -8019,7 +8229,7 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL AND observation = 0"
     ).fetchall()
     if not rows:
         return False
@@ -8199,6 +8409,9 @@ def _dispatch_once_locked(
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    # Close orphaned external observation cards (→ done, never ready) so
+    # they can't sit in 'running' forever when their adapter died.
+    result.observation_expired = expire_orphan_observations(conn)
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -8207,17 +8420,20 @@ def _dispatch_once_locked(
     # board, since "running" tasks aren't reclaimed by completion alone —
     # they sit in status='running' until the worker calls
     # kanban_complete/kanban_block (or the dispatcher TTL-reclaims them).
+    # Observation cards sit in status='running' for the whole external turn
+    # but consume no worker slot, so every concurrency count excludes them.
     running_count = 0
     if max_spawn is not None:
         running_count = int(
             conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                "SELECT COUNT(*) FROM tasks "
+                "WHERE status = 'running' AND observation = 0"
             ).fetchone()[0]
         )
 
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
+        "WHERE status = 'ready' AND claim_lock IS NULL AND observation = 0 "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     # Honour kanban.max_in_progress: if the board already has enough running
@@ -8226,7 +8442,8 @@ def _dispatch_once_locked(
     # pile up and time out.
     if max_in_progress is not None and ready_rows:
         in_progress = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+            "SELECT COUNT(*) FROM tasks "
+            "WHERE status = 'running' AND observation = 0"
         ).fetchone()[0]
         if in_progress >= max_in_progress:
             return result
