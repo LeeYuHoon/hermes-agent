@@ -174,6 +174,21 @@ def test_running_observation_does_not_consume_in_progress_budget(kanban_home):
         conn.close()
 
 
+def test_running_observation_does_not_consume_per_profile_budget(kanban_home):
+    conn = kb.connect()
+    try:
+        _create_observation(conn, assignee="default")
+        normal = kb.create_task(conn, title="real work", assignee="default")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            max_in_progress_per_profile=1,
+        )
+        assert [entry[0] for entry in result.spawned] == [normal]
+    finally:
+        conn.close()
+
+
 def test_stale_and_recovery_paths_ignore_observations(kanban_home):
     conn = kb.connect()
     try:
@@ -279,6 +294,30 @@ def test_promote_and_unblock_are_rejected(kanban_home):
         assert "observation" in reason
         assert kb.unblock_task(conn, obs) is False
         assert kb.get_task(conn, obs).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_block_and_schedule_are_rejected(kanban_home):
+    conn = kb.connect()
+    try:
+        obs = _create_observation(conn)
+        assert kb.block_task(conn, obs, reason="must not strand observation") is False
+        assert kb.schedule_task(conn, obs, reason="must not schedule observation") is False
+        assert kb.get_task(conn, obs).status == "running"
+    finally:
+        conn.close()
+
+
+def test_dashboard_direct_status_move_is_rejected(kanban_home):
+    from plugins.kanban.dashboard import plugin_api
+
+    conn = kb.connect()
+    try:
+        obs = _create_observation(conn)
+        assert plugin_api._set_status_direct(conn, obs, "ready") is False
+        assert plugin_api._set_status_direct(conn, obs, "todo") is False
+        assert kb.get_task(conn, obs).status == "running"
     finally:
         conn.close()
 
