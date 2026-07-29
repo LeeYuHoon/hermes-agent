@@ -1027,10 +1027,16 @@ def _set_status_direct(
     with kanban_db.write_txn(conn):
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
-            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            "SELECT status, current_run_id, observation FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if prev is None:
+            return False
+        if prev["observation"]:
+            # Observation cards have a deliberately narrow lifecycle:
+            # running -> done/archive. Structured complete/archive handlers
+            # own those terminal transitions; drag/drop must not move an
+            # external turn into a worker-managed status.
             return False
 
         # Guard: don't allow promoting to 'ready' unless all parents are done.

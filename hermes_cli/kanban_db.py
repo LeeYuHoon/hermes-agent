@@ -5702,10 +5702,16 @@ def block_task(
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, observation "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
+            return False
+        if cur_row["observation"]:
+            # Observation cards only terminate through complete/archive or
+            # the orphan-expiry sweep. Blocking would strand the card outside
+            # that lifecycle and could later route it toward ``ready``.
             return False
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
@@ -6758,6 +6764,13 @@ def schedule_task(
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
     with write_txn(conn):
+        obs_row = conn.execute(
+            "SELECT observation FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if obs_row is not None and obs_row["observation"]:
+            # Like block/unblock, scheduling is a worker lifecycle operation;
+            # an external observation must remain running until it is closed.
+            return False
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -8464,6 +8477,7 @@ def _dispatch_once_locked(
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
             "WHERE status = 'running' AND assignee IS NOT NULL "
+            "  AND observation = 0 "
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
