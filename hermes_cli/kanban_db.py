@@ -249,24 +249,30 @@ DEFAULT_OBSERVATION_TTL_SECONDS = 24 * 60 * 60
 
 
 def _resolve_observation_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
-    """Effective orphan-observation TTL, honoring the kanban env override.
+    """Return the effective orphan-observation TTL.
 
-    Mirrors ``_resolve_claim_ttl_seconds``: explicit call-site values win,
-    then a positive integer from ``HERMES_KANBAN_OBSERVATION_TTL_SECONDS``,
-    then the built-in default. Invalid or non-positive values fall back
-    silently — an observation card can never opt into an infinite TTL.
+    Explicit call-site values win, followed by the positive
+    ``kanban.observation_ttl_seconds`` value in ``config.yaml`` and then the
+    built-in default. Invalid or non-positive values fall back silently — an
+    observation card can never opt into an infinite TTL.
     """
     if ttl_seconds is not None:
         return max(1, int(ttl_seconds))
 
-    raw = os.environ.get("HERMES_KANBAN_OBSERVATION_TTL_SECONDS", "").strip()
-    if raw:
-        try:
-            parsed = int(raw)
-        except ValueError:
-            parsed = 0
+    try:
+        from hermes_cli.config import load_config
+
+        raw = (load_config().get("kanban") or {}).get(
+            "observation_ttl_seconds"
+        )
+        parsed = int(raw)
         if parsed > 0:
             return parsed
+    except (AttributeError, TypeError, ValueError):
+        pass
+    except Exception:
+        # A malformed/unavailable config must not disable orphan expiry.
+        pass
 
     return DEFAULT_OBSERVATION_TTL_SECONDS
 
@@ -3128,20 +3134,31 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
-    if idempotency_key:
+    def _existing_idempotent_task() -> Optional[str]:
+        if not idempotency_key:
+            return None
         row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "SELECT id, observation FROM tasks WHERE idempotency_key = ? "
             "AND status != 'archived' "
             "ORDER BY created_at DESC LIMIT 1",
             (idempotency_key,),
         ).fetchone()
         if row:
+            if bool(row["observation"]) != bool(observation):
+                raise ValueError(
+                    "idempotency key is already attached to a "
+                    f"{'observation' if row['observation'] else 'worker'} task"
+                )
             return row["id"]
+        return None
+
+    # Keep the common retry path lock-free. The same lookup is repeated after
+    # acquiring the write lock below, which is the authoritative check that
+    # prevents two concurrent creators from both inserting the same logical
+    # task.
+    existing_task_id = _existing_idempotent_task()
+    if existing_task_id is not None:
+        return existing_task_id
 
     now = int(time.time())
 
@@ -3170,6 +3187,9 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
+                existing_task_id = _existing_idempotent_task()
+                if existing_task_id is not None:
+                    return existing_task_id
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -3492,10 +3512,14 @@ def set_model_override(
         provider = None
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, observation FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if not row:
             return False
+        if row["observation"]:
+            raise RuntimeError(
+                f"cannot set a worker model override on observation card {task_id}"
+            )
         if row["status"] == "archived":
             raise RuntimeError(f"cannot set model override on archived task {task_id}")
         conn.execute(
@@ -4420,7 +4444,8 @@ def heartbeat_claim(
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock = ?",
+            "WHERE id = ? AND status = 'running' AND claim_lock = ? "
+            "AND observation = 0",
             (expires, task_id, lock),
         )
         if cur.rowcount == 1:
@@ -4592,9 +4617,9 @@ def expire_orphan_observations(
     heartbeat — the only terminal signal is the adapter's ``complete``.
     When that never arrives, the card must not linger in ``running``
     forever, and it must never be handed to the dispatcher: after
-    ``ttl_seconds`` (default :data:`DEFAULT_OBSERVATION_TTL_SECONDS`,
-    env-overridable via ``HERMES_KANBAN_OBSERVATION_TTL_SECONDS``) the
-    card is closed as ``done`` with an abnormal-end ``result`` and an
+    ``ttl_seconds`` (default :data:`DEFAULT_OBSERVATION_TTL_SECONDS`, or
+    ``kanban.observation_ttl_seconds`` from ``config.yaml``) the card is
+    closed as ``done`` with an abnormal-end ``result`` and an
     ``observation_expired`` audit event.
 
     Called from every dispatcher tick and from the CLI ``list`` mini-
@@ -4949,6 +4974,10 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        task_row = conn.execute(
+            "SELECT observation FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        is_observation = bool(task_row and task_row["observation"])
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -5008,7 +5037,11 @@ def complete_task(
         # blocked → done with no run in flight), synthesize a
         # zero-duration run so the handoff fields are persisted in
         # attempt history instead of silently lost.
-        if run_id is None and (summary or metadata or result):
+        if (
+            run_id is None
+            and not is_observation
+            and (summary or metadata or result)
+        ):
             run_id = _synthesize_ended_run(
                 conn, task_id,
                 outcome="completed",
@@ -5605,7 +5638,7 @@ def edit_completed_task_result(
     handoff_summary = summary if summary is not None else result
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, observation FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if not row or row["status"] != "done":
             return False
@@ -5624,7 +5657,7 @@ def edit_completed_task_result(
             (task_id,),
         ).fetchone()
         run_id = int(run["id"]) if run else None
-        if run_id is None:
+        if run_id is None and not row["observation"]:
             run_id = _synthesize_ended_run(
                 conn, task_id,
                 outcome="completed",
@@ -6060,7 +6093,8 @@ def specify_triage_task(
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+            "SELECT title, body, assignee FROM tasks "
+            "WHERE id = ? AND status = 'triage' AND observation = 0",
             (task_id,),
         ).fetchone()
         if existing is None:
@@ -6083,7 +6117,7 @@ def specify_triage_task(
         params.append(task_id)
         cur = conn.execute(
             f"UPDATE tasks SET {', '.join(sets)} "
-            f"WHERE id = ? AND status = 'triage'",
+            f"WHERE id = ? AND status = 'triage' AND observation = 0",
             tuple(params),
         )
         if cur.rowcount != 1:
@@ -6214,13 +6248,14 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, "
+            "observation "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if root_row is None:
             return None
-        if root_row["status"] != "triage":
+        if root_row["status"] != "triage" or root_row["observation"]:
             return None
         tenant = root_row["tenant"]
         # Children inherit the root's workspace by default so a fan-out
@@ -6737,7 +6772,8 @@ def set_workspace_path(
 ) -> None:
     with write_txn(conn):
         conn.execute(
-            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            "UPDATE tasks SET workspace_path = ? "
+            "WHERE id = ? AND observation = 0",
             (str(path), task_id),
         )
 
@@ -6747,7 +6783,8 @@ def set_branch_name(
 ) -> None:
     with write_txn(conn):
         conn.execute(
-            "UPDATE tasks SET branch_name = ? WHERE id = ?",
+            "UPDATE tasks SET branch_name = ? "
+            "WHERE id = ? AND observation = 0",
             (str(branch_name), task_id),
         )
 
@@ -7189,7 +7226,8 @@ def _defer_reclaim_for_live_worker(
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
+            "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
+            "AND observation = 0",
             (grace, task_id, claim_lock),
         )
         if cur.rowcount != 1:
@@ -7231,13 +7269,14 @@ def heartbeat_worker(
         if expected_run_id is None:
             cur = conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ? "
-                "WHERE id = ? AND status = 'running'",
+                "WHERE id = ? AND status = 'running' AND observation = 0",
                 (now, task_id),
             )
         else:
             cur = conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ? "
-                "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+                "WHERE id = ? AND status = 'running' AND current_run_id = ? "
+                "AND observation = 0",
                 (now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
@@ -7925,10 +7964,12 @@ def _record_task_failure(
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
+            "SELECT consecutive_failures, status, max_retries, observation "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
+            return False
+        if row["observation"]:
             return False
         failures = int(row["consecutive_failures"]) + 1
         cur_status = row["status"]
@@ -8055,10 +8096,13 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     the drawer.
     """
     with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+        cur = conn.execute(
+            "UPDATE tasks SET worker_pid = ? "
+            "WHERE id = ? AND observation = 0",
             (int(pid), task_id),
         )
+        if cur.rowcount != 1:
+            return
         run_id = _current_run_id(conn, task_id)
         if run_id is not None:
             conn.execute(
@@ -8268,7 +8312,7 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL AND observation = 0"
     ).fetchall()
     if not rows:
         return False
@@ -8690,7 +8734,7 @@ def _dispatch_once_locked(
     # running workers stays bounded.
     review_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
-        "WHERE status = 'review' AND claim_lock IS NULL "
+        "WHERE status = 'review' AND claim_lock IS NULL AND observation = 0 "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     for row in review_rows:
