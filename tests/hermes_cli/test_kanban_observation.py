@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -123,6 +124,52 @@ def test_observation_idempotency_key_returns_existing_card(kanban_home):
             ("claude:s1:t1",),
         ).fetchone()["n"]
         assert count == 1
+    finally:
+        conn.close()
+
+
+def test_observation_idempotency_key_rejects_worker_task_collision(kanban_home):
+    conn = kb.connect()
+    try:
+        normal = kb.create_task(
+            conn, title="normal", idempotency_key="shared:key"
+        )
+        with pytest.raises(ValueError, match="idempotency key.*worker"):
+            _create_observation(conn, idempotency_key="shared:key")
+        assert kb.get_task(conn, normal).status == "ready"
+
+        observation = _create_observation(
+            conn, idempotency_key="observation:key"
+        )
+        with pytest.raises(ValueError, match="idempotency key.*observation"):
+            kb.create_task(
+                conn, title="normal", idempotency_key="observation:key"
+            )
+        assert kb.get_task(conn, observation).status == "running"
+    finally:
+        conn.close()
+
+
+def test_observation_idempotency_is_atomic_across_connections(kanban_home):
+    def create_once(_: int) -> str:
+        conn = kb.connect()
+        try:
+            return _create_observation(
+                conn, idempotency_key="concurrent:observation"
+            )
+        finally:
+            conn.close()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        task_ids = list(pool.map(create_once, range(8)))
+
+    assert len(set(task_ids)) == 1
+    conn = kb.connect()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE idempotency_key = ?",
+            ("concurrent:observation",),
+        ).fetchone()["n"] == 1
     finally:
         conn.close()
 
@@ -309,6 +356,36 @@ def test_block_and_schedule_are_rejected(kanban_home):
         conn.close()
 
 
+def test_worker_lifecycle_helpers_cannot_mutate_observation(kanban_home):
+    conn = kb.connect()
+    try:
+        obs = _create_observation(conn)
+        before = kb.get_task(conn, obs)
+
+        assert kb.heartbeat_claim(conn, obs, claimer="external") is False
+        assert kb.heartbeat_worker(conn, obs, note="not a worker") is False
+        assert kb._record_spawn_failure(conn, obs, "not a worker") is False
+        kb._set_worker_pid(conn, obs, 12345)
+        kb.set_workspace_path(conn, obs, "/tmp/worker")
+        kb.set_branch_name(conn, obs, "worker/branch")
+        with pytest.raises(RuntimeError, match="observation"):
+            kb.set_model_override(conn, obs, "worker-model")
+
+        after = kb.get_task(conn, obs)
+        assert after.status == "running"
+        assert after.claim_expires is None
+        assert after.last_heartbeat_at is None
+        assert after.worker_pid is None
+        assert after.workspace_path is None
+        assert after.branch_name is None
+        assert after.model_override is None
+        assert after.consecutive_failures == before.consecutive_failures == 0
+        assert "heartbeat" not in _events(conn, obs)
+        assert "spawned" not in _events(conn, obs)
+    finally:
+        conn.close()
+
+
 def test_dashboard_direct_status_move_is_rejected(kanban_home):
     from plugins.kanban.dashboard import plugin_api
 
@@ -330,6 +407,17 @@ def test_complete_closes_observation_as_done(kanban_home):
         task = kb.get_task(conn, obs)
         assert task.status == "done"
         assert task.completed_at is not None
+        assert task.current_run_id is None
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM task_runs WHERE task_id = ?", (obs,)
+        ).fetchone()["n"] == 0
+
+        assert kb.edit_completed_task_result(
+            conn, obs, result="corrected external result"
+        )
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM task_runs WHERE task_id = ?", (obs,)
+        ).fetchone()["n"] == 0
     finally:
         conn.close()
 
@@ -364,8 +452,14 @@ def test_orphan_observation_expires_to_done_with_audit_event(kanban_home):
         conn.close()
 
 
-def test_observation_ttl_env_override(kanban_home, monkeypatch):
-    monkeypatch.setenv("HERMES_KANBAN_OBSERVATION_TTL_SECONDS", "60")
+def test_observation_ttl_config_override(kanban_home, monkeypatch):
+    from hermes_cli import config
+
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda: {"kanban": {"observation_ttl_seconds": 60}},
+    )
     conn = kb.connect()
     try:
         obs = _create_observation(conn)
