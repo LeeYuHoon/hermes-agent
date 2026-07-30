@@ -36,8 +36,10 @@ the port.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import re
 import sqlite3
 import time
 from dataclasses import asdict
@@ -153,6 +155,180 @@ BOARD_COLUMNS: list[str] = [
 
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
+_TOKEN_HEADERS = {
+    "claude-code": "Agent tool usage",
+    "codex": "Codex tool usage",
+    "hermes-agent": "Hermes Agent tool usage",
+}
+_TOKEN_EVENT_RE = re.compile(r"usage-[0-9a-f]{32}\Z")
+_TOKEN_FIELDS = ("input", "output", "cache_read", "cache_write", "reasoning", "requests")
+_TOKEN_LIMIT = 1_000_000_000_000_000
+
+
+def _parse_token_comment(body: Any, task_id: str) -> Optional[dict[str, Any]]:
+    """Parse one adapter-owned usage comment and validate provider totals."""
+    if not isinstance(body, str):
+        return None
+    header, separator, raw = body.partition("\n")
+    if not separator:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return None
+    source = payload.get("source")
+    if not isinstance(source, str) or _TOKEN_HEADERS.get(source) != header:
+        return None
+    event_id = payload.get("event_id")
+    if not isinstance(event_id, str) or not _TOKEN_EVENT_RE.fullmatch(event_id):
+        return None
+    expected_event_id = "usage-" + hashlib.sha256(
+        f"{source}\0{task_id}".encode("utf-8")
+    ).hexdigest()[:32]
+    if event_id != expected_event_id:
+        return None
+    raw_tokens = payload.get("tokens")
+    if not isinstance(raw_tokens, dict):
+        return None
+    tokens: dict[str, Optional[int]] = {}
+    for field in _TOKEN_FIELDS:
+        value = raw_tokens.get(field)
+        if value is None:
+            if field in raw_tokens:
+                tokens[field] = None
+            continue
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+            or value > _TOKEN_LIMIT
+        ):
+            return None
+        tokens[field] = value
+    if not any(isinstance(tokens.get(field), int) for field in _TOKEN_FIELDS[:4]):
+        return None
+    total = 0
+    for field in _TOKEN_FIELDS[:4]:
+        value = tokens.get(field)
+        if isinstance(value, int):
+            total += value
+    raw_total = raw_tokens.get("total")
+    tokens["total"] = (
+        raw_total
+        if isinstance(raw_total, int)
+        and not isinstance(raw_total, bool)
+        and 0 <= raw_total <= _TOKEN_LIMIT
+        else total
+    )
+    model = payload.get("model")
+    return {
+        "event_id": event_id,
+        "source": source,
+        "model": model if isinstance(model, str) else None,
+        "tokens": tokens,
+    }
+
+
+def _reasoning_coverage(*, known: int, unknown: int, sources: set[str]) -> str:
+    if known and unknown:
+        return "partial"
+    if known:
+        return "complete"
+    if unknown and sources == {"claude-code"}:
+        return "output_included"
+    return "unavailable"
+
+
+def _token_usage_rollup(
+    conn: sqlite3.Connection,
+    task_ids: list[str],
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Return per-task usage and a deduplicated aggregate for selected tasks."""
+    selected = set(task_ids)
+    events_by_task: dict[str, list[dict[str, Any]]] = {}
+    seen_events: set[str] = set()
+    if selected:
+        rows: list[sqlite3.Row] = []
+        selected_ids = sorted(selected)
+        header_patterns = tuple(f"{header}\n%" for header in _TOKEN_HEADERS.values())
+        for offset in range(0, len(selected_ids), 500):
+            chunk = selected_ids[offset:offset + 500]
+            task_slots = ",".join("?" for _ in chunk)
+            header_slots = " OR ".join("body LIKE ?" for _ in header_patterns)
+            rows.extend(conn.execute(
+                "SELECT id, task_id, body FROM task_comments "
+                f"WHERE task_id IN ({task_slots}) AND ({header_slots})",
+                (*chunk, *header_patterns),
+            ).fetchall())
+        for row in sorted(rows, key=lambda item: item["id"]):
+            task_id = row["task_id"]
+            if task_id not in selected:
+                continue
+            event = _parse_token_comment(row["body"], task_id)
+            if event is None or event["event_id"] in seen_events:
+                continue
+            seen_events.add(event["event_id"])
+            events_by_task.setdefault(task_id, []).append(event)
+
+    per_task: dict[str, dict[str, Any]] = {}
+    board_sums = {field: 0 for field in _TOKEN_FIELDS}
+    board_known_reasoning = 0
+    board_unknown_reasoning = 0
+    board_total = 0
+    board_sources: set[str] = set()
+    for task_id, events in events_by_task.items():
+        sums = {field: 0 for field in _TOKEN_FIELDS}
+        known_reasoning = 0
+        unknown_reasoning = 0
+        task_total = 0
+        sources = {event["source"] for event in events}
+        models = {event["model"] for event in events if event.get("model")}
+        for event in events:
+            tokens = event["tokens"]
+            for field in _TOKEN_FIELDS:
+                value = tokens.get(field)
+                if isinstance(value, int):
+                    sums[field] += value
+            if isinstance(tokens.get("reasoning"), int):
+                known_reasoning += 1
+            else:
+                unknown_reasoning += 1
+            task_total += tokens["total"]
+        rendered_tokens: dict[str, Optional[int]] = dict(sums)
+        if not known_reasoning:
+            rendered_tokens["reasoning"] = None
+        rendered_tokens["total"] = task_total
+        per_task[task_id] = {
+            "tokens": rendered_tokens,
+            "source": next(iter(sources)) if len(sources) == 1 else "mixed",
+            "model": next(iter(models)) if len(models) == 1 else None,
+            "reasoning_coverage": _reasoning_coverage(
+                known=known_reasoning, unknown=unknown_reasoning, sources=sources,
+            ),
+        }
+        for field in _TOKEN_FIELDS:
+            board_sums[field] += sums[field]
+        board_known_reasoning += known_reasoning
+        board_unknown_reasoning += unknown_reasoning
+        board_total += task_total
+        board_sources.update(sources)
+
+    board_tokens: dict[str, Optional[int]] = dict(board_sums)
+    if not board_known_reasoning:
+        board_tokens["reasoning"] = None
+    board_tokens["total"] = board_total
+    return per_task, {
+        "tokens": board_tokens,
+        "tracked_tasks": len(per_task),
+        "total_tasks": len(task_ids),
+        "reasoning_coverage": _reasoning_coverage(
+            known=board_known_reasoning,
+            unknown=board_unknown_reasoning,
+            sources=board_sources,
+        ),
+    }
 
 
 def _task_dict(
@@ -457,7 +633,9 @@ def get_board(
         # window-function query (avoids N+1 ``latest_summary`` calls
         # for boards with hundreds of tasks). Truncated to a card-size
         # preview here — the full text is available via /tasks/:id.
-        summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        task_ids = [t.id for t in tasks]
+        summary_map = kanban_db.latest_summaries(conn, task_ids)
+        token_usage_by_task, board_token_usage = _token_usage_rollup(conn, task_ids)
 
         for t in tasks:
             full = summary_map.get(t.id)
@@ -467,6 +645,7 @@ def get_board(
             d = _task_dict(t, latest_summary=preview)
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
+            d["token_usage"] = token_usage_by_task.get(t.id)
             d["progress"] = progress.get(t.id)  # None when the task has no children
             diags = diagnostics_per_task.get(t.id)
             if diags:
@@ -503,6 +682,7 @@ def get_board(
             ],
             "tenants": tenants,
             "assignees": assignees,
+            "token_usage": board_token_usage,
             "latest_event_id": int(latest_event_id),
             "now": int(time.time()),
         }
@@ -546,6 +726,8 @@ def get_task(
         # a second round-trip. Cards on /board carry a 200-char preview.
         full_summary = kanban_db.latest_summary(conn, task_id)
         task_d = _task_dict(task, latest_summary=full_summary)
+        token_usage_by_task, _token_usage = _token_usage_rollup(conn, [task_id])
+        task_d["token_usage"] = token_usage_by_task.get(task_id)
         links = _links_for(conn, task_id)
         child_ids = links["children"]
         child_summaries = kanban_db.latest_summaries(conn, child_ids)
@@ -2115,6 +2297,41 @@ def _board_counts(slug: str) -> dict[str, int]:
         return {}
 
 
+def _board_token_usage(slug: str, *, include_archived: bool) -> dict[str, Any]:
+    """Return all-time usage for one board, excluding archived cards by default."""
+    try:
+        path = kanban_db.kanban_db_path(board=slug)
+        if not path.exists():
+            return {
+                "tokens": {
+                    "input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+                    "reasoning": None, "requests": 0, "total": 0,
+                },
+                "tracked_tasks": 0,
+                "total_tasks": 0,
+                "reasoning_coverage": "unavailable",
+            }
+        conn = kanban_db.connect(board=slug)
+        try:
+            where = "" if include_archived else " WHERE status != 'archived'"
+            task_ids = [
+                row["id"] for row in conn.execute(f"SELECT id FROM tasks{where}").fetchall()
+            ]
+            return _token_usage_rollup(conn, task_ids)[1]
+        finally:
+            conn.close()
+    except Exception:
+        return {
+            "tokens": {
+                "input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+                "reasoning": None, "requests": 0, "total": 0,
+            },
+            "tracked_tasks": 0,
+            "total_tasks": 0,
+            "reasoning_coverage": "unavailable",
+        }
+
+
 def _default_workspace_kind(board: dict[str, Any]) -> str:
     """Recommend a non-destructive task workspace from board metadata."""
     workdir = str(board.get("default_workdir") or "").strip()
@@ -2135,6 +2352,9 @@ def list_boards(include_archived: bool = Query(False)):
         b["is_current"] = (b["slug"] == current)
         b["counts"] = _board_counts(b["slug"])
         b["total"] = sum(b["counts"].values())
+        b["token_usage"] = _board_token_usage(
+            b["slug"], include_archived=include_archived,
+        )
         b["default_workspace_kind"] = _default_workspace_kind(b)
     return {"boards": boards, "current": current}
 

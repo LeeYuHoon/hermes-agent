@@ -244,6 +244,112 @@
     return `${url}${sep}board=${encodeURIComponent(board)}`;
   }
 
+  function formatTokenCount(value, compact, i18n) {
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      return tx(i18n, "notAvailableSymbol", "—");
+    }
+    if (compact && value >= 1000) {
+      return new Intl.NumberFormat(undefined, {
+        notation: "compact",
+        maximumFractionDigits: 1,
+      }).format(value);
+    }
+    return new Intl.NumberFormat().format(value);
+  }
+
+  function reasoningTokenLabel(usage, i18n) {
+    if (!usage || !usage.tokens) return tx(i18n, "notAvailableSymbol", "—");
+    if (usage.reasoning_coverage === "output_included") {
+      return tx(i18n, "reasoningIncludedInOutput", "Included in output");
+    }
+    const value = usage.tokens.reasoning;
+    if (typeof value !== "number") return tx(i18n, "notAvailable", "N/A");
+    const suffix = usage.reasoning_coverage === "partial"
+      ? tx(i18n, "tokenPartialSuffix", " (partial)")
+      : "";
+    return formatTokenCount(value, false, i18n) + suffix;
+  }
+
+  function TokenBoardSummary(props) {
+    const { t: i18n } = useI18n();
+    const usage = props.usage;
+    if (!usage) return null;
+    const tokens = usage.tokens || {};
+    const cache = (typeof tokens.cache_read === "number" ? tokens.cache_read : 0)
+      + (typeof tokens.cache_write === "number" ? tokens.cache_write : 0);
+    const fields = [
+      [tx(i18n, "tokenTotal", "Total"), formatTokenCount(tokens.total, true, i18n),
+        tx(i18n, "tokenTotalHint", "Provider-reported total; provider semantics may differ from the displayed buckets.")],
+      [tx(i18n, "tokenInput", "Input"), formatTokenCount(tokens.input, true, i18n)],
+      [tx(i18n, "tokenCache", "Cache"), formatTokenCount(cache, true, i18n)],
+      [tx(i18n, "tokenOutput", "Output"), formatTokenCount(tokens.output, true, i18n)],
+      [tx(i18n, "tokenReasoning", "Reasoning"), reasoningTokenLabel(usage, i18n)],
+    ];
+    return h("section", {
+      className: "hermes-kanban-token-summary",
+      "aria-label": tx(i18n, "boardTokenUsage", "Board token usage"),
+    },
+      h("div", { className: "hermes-kanban-token-summary-grid" },
+        fields.map(function (field) {
+          return h("div", {
+            key: field[0],
+            className: "hermes-kanban-token-summary-item",
+            title: field[2] || undefined,
+          },
+            h("span", { className: "hermes-kanban-token-label" }, field[0]),
+            h("strong", null, field[1]),
+          );
+        }),
+      ),
+      h("div", { className: "hermes-kanban-token-coverage" },
+        usage.tracked_tasks > 0
+          ? tx(i18n, "tokenCoverage", "Token coverage: {tracked} / {total} cards", {
+              tracked: usage.tracked_tasks, total: usage.total_tasks,
+            })
+          : tx(i18n, "noTokenData", "No token data · 0 / {total} cards tracked", {
+              total: usage.total_tasks,
+            }),
+      ),
+    );
+  }
+
+  function TokenUsageDetail(props) {
+    const { t: i18n } = useI18n();
+    const usage = props.usage;
+    if (!usage || !usage.tokens) return null;
+    const tokens = usage.tokens;
+    const rows = [
+      [tx(i18n, "tokenTotal", "Total"), formatTokenCount(tokens.total, false, i18n),
+        tx(i18n, "tokenTotalHint", "Provider-reported total; provider semantics may differ from the displayed buckets.")],
+      [tx(i18n, "tokenInput", "Input"), formatTokenCount(tokens.input, false, i18n)],
+      [tx(i18n, "tokenCacheRead", "Cache read"), formatTokenCount(tokens.cache_read, false, i18n)],
+      [tx(i18n, "tokenCacheWrite", "Cache write"), formatTokenCount(tokens.cache_write, false, i18n)],
+      [tx(i18n, "tokenOutput", "Output"), formatTokenCount(tokens.output, false, i18n)],
+      [tx(i18n, "tokenReasoning", "Reasoning"), reasoningTokenLabel(usage, i18n)],
+      [tx(i18n, "tokenRequests", "Requests"), formatTokenCount(tokens.requests, false, i18n)],
+    ];
+    return h("div", { className: "hermes-kanban-section hermes-kanban-token-detail" },
+      h("div", { className: "hermes-kanban-section-head" },
+        tx(i18n, "tokenUsage", "Token usage")),
+      h("div", { className: "hermes-kanban-token-source" },
+        [usage.source, usage.model].filter(Boolean).join(" · ")
+          || tx(i18n, "runtimeUnavailable", "Runtime unavailable"),
+      ),
+      h("div", { className: "hermes-kanban-token-grid" },
+        rows.map(function (row) {
+          return h("div", {
+            key: row[0],
+            className: "hermes-kanban-token-cell",
+            title: row[2] || undefined,
+          },
+            h("span", { className: "hermes-kanban-token-label" }, row[0]),
+            h("strong", null, row[1]),
+          );
+        }),
+      ),
+    );
+  }
+
   // The SDK's Select component fires ``onValueChange(value)`` directly
   // (it's a shadcn-style popup, not a native <select>). Older plugin
   // code calls ``onChange({target: {value}})`` which silently never
@@ -1052,6 +1158,7 @@
           onSettingsClick: function () { setShowBoardSettings(true); },
           onDeleteBoard: deleteBoard,
         }),
+        h(TokenBoardSummary, { usage: boardData.token_usage }),
         showNewBoard ? h(NewBoardDialog, {
           onCancel: function () { setShowNewBoard(false); },
           onCreate: function (payload) {
@@ -1879,8 +1986,11 @@
               title: "Boards are independent work streams. Each board has its own tasks, tenants, and assignees.",
             }, selectChangeHandler(function (v) { if (v) props.onSwitch(v); })),
               list.map(function (b) {
+                const tokenTotal = b.token_usage && b.token_usage.tracked_tasks > 0
+                  ? ` · ${formatTokenCount(b.token_usage.tokens.total, true, t)} ${tx(t, "tokenUnitShort", "tok")}`
+                  : "";
                 const label = b.total > 0
-                  ? `${b.name || b.slug} · ${b.total}`
+                  ? `${b.name || b.slug} · ${b.total}${tokenTotal}`
                   : (b.name || b.slug);
                 return h(SelectOption, { key: b.slug, value: b.slug }, label);
               }),
@@ -2882,6 +2992,14 @@
               ? h("span", { className: "hermes-kanban-count",
                             title: `${t.comment_count} comment${t.comment_count === 1 ? "" : "s"} on this task` }, "💬 ", t.comment_count)
               : null,
+            t.token_usage
+              ? h("span", {
+                  className: "hermes-kanban-token-badge",
+                  title: tx(i18n, "runtimeTokenUsage", "{runtime} token usage", {
+                    runtime: `${t.token_usage.source || tx(i18n, "runtime", "runtime")}${t.token_usage.model ? " · " + t.token_usage.model : ""}`,
+                  }),
+                }, `${formatTokenCount(t.token_usage.tokens.total, true, i18n)} ${tx(i18n, "tokenUnitShort", "tok")}`)
+              : null,
             t.link_counts && (t.link_counts.parents + t.link_counts.children) > 0
               ? h("span", { className: "hermes-kanban-count",
                             title: `${t.link_counts.parents} parent${t.link_counts.parents === 1 ? "" : "s"}, ${t.link_counts.children} child${t.link_counts.children === 1 ? "" : "ren"}. Children stay blocked until their parent is done.` },
@@ -3597,6 +3715,7 @@
         }) : null,
         t.created_by ? h(MetaRow, { label: tx(i18n, "createdBy", "Created by"), value: t.created_by }) : null,
       ),
+      h(TokenUsageDetail, { usage: t.token_usage }),
       h(StatusActions, {
         task: t,
         onPatch: props.onPatch,
