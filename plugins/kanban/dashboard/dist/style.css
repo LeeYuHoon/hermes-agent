@@ -62,6 +62,68 @@
 
 /* ---- Columns layout -------------------------------------------------- */
 
+.hermes-kanban-token-summary {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  padding: 0.65rem 0.8rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md, 0.4rem);
+  background: color-mix(in srgb, var(--color-foreground) 3%, transparent);
+}
+
+.hermes-kanban-token-summary-grid {
+  display: flex;
+  gap: 1.15rem;
+  flex-wrap: wrap;
+}
+
+.hermes-kanban-token-summary-item,
+.hermes-kanban-token-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  font-size: 0.78rem;
+}
+
+.hermes-kanban-token-label,
+.hermes-kanban-token-source,
+.hermes-kanban-token-coverage {
+  color: var(--color-muted-foreground);
+  font-size: 0.68rem;
+}
+
+.hermes-kanban-token-coverage { margin-left: auto; }
+
+.hermes-kanban-token-badge {
+  padding: 0.05rem 0.3rem;
+  border: 1px solid color-mix(in srgb, var(--color-primary, #6ea8fe) 42%, var(--color-border));
+  border-radius: 999px;
+  color: var(--color-foreground);
+  background: color-mix(in srgb, var(--color-primary, #6ea8fe) 12%, transparent);
+  font-variant-numeric: tabular-nums;
+}
+
+.hermes-kanban-token-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
+  gap: 0.55rem;
+  margin-top: 0.5rem;
+}
+
+.hermes-kanban-token-cell {
+  padding: 0.45rem 0.5rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 0.25rem);
+  background: color-mix(in srgb, var(--color-foreground) 3%, transparent);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 640px) {
+  .hermes-kanban-token-coverage { margin-left: 0; width: 100%; }
+}
+
 .hermes-kanban-columns {
   display: flex;
   gap: 0.75rem;
