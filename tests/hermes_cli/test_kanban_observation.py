@@ -403,18 +403,36 @@ def test_complete_closes_observation_as_done(kanban_home):
     conn = kb.connect()
     try:
         obs = _create_observation(conn)
-        assert kb.complete_task(conn, obs, result="external turn finished")
+        assert kb.complete_task(
+            conn,
+            obs,
+            result="external turn finished in full",
+            summary="external turn summary\nwith verification",
+        )
         task = kb.get_task(conn, obs)
         assert task.status == "done"
         assert task.completed_at is not None
         assert task.current_run_id is None
+        assert kb.latest_summary(conn, obs) == "external turn summary\nwith verification"
+        assert kb.latest_summaries(conn, [obs]) == {
+            obs: "external turn summary\nwith verification"
+        }
         assert conn.execute(
             "SELECT COUNT(*) AS n FROM task_runs WHERE task_id = ?", (obs,)
         ).fetchone()["n"] == 0
 
         assert kb.edit_completed_task_result(
-            conn, obs, result="corrected external result"
+            conn,
+            obs,
+            result="corrected external result in full",
+            summary="corrected summary\nwith final verification",
         )
+        assert kb.latest_summary(conn, obs) == (
+            "corrected summary\nwith final verification"
+        )
+        assert kb.latest_summaries(conn, [obs]) == {
+            obs: "corrected summary\nwith final verification"
+        }
         assert conn.execute(
             "SELECT COUNT(*) AS n FROM task_runs WHERE task_id = ?", (obs,)
         ).fetchone()["n"] == 0

@@ -771,6 +771,32 @@ def test_task_detail_exposes_latest_summary_when_result_is_empty(client):
     assert data["latest_summary"] == "Report written to /output/report.md"
 
 
+def test_observation_detail_exposes_event_summary_separately_from_result(client):
+    """External-agent cards have no run row, so their event carries the handoff."""
+    conn = kb.connect()
+    task_id = kb.create_task(
+        conn,
+        title="Observed external turn",
+        observation=True,
+    )
+    kb.complete_task(
+        conn,
+        task_id,
+        result="Complete external-agent response",
+        summary="Concise external-agent handoff\nwith verification",
+    )
+    assert kb.list_runs(conn, task_id) == []
+    conn.close()
+
+    r = client.get(f"/api/plugins/kanban/tasks/{task_id}")
+    assert r.status_code == 200
+    data = r.json()["task"]
+    assert data["result"] == "Complete external-agent response"
+    assert data["latest_summary"] == (
+        "Concise external-agent handoff\nwith verification"
+    )
+
+
 def test_task_detail_latest_summary_none_when_nothing_recorded(client):
     """When no run summary exists, the existing field remains None."""
     r = client.post(

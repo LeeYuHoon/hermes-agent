@@ -5058,6 +5058,13 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        if is_observation:
+            # Observation cards deliberately have no task_runs row, but the
+            # dashboard still needs the bounded handoff separately from the
+            # full tasks.result. Keep the notifier preview above unchanged.
+            full_summary = (summary if summary is not None else result) or ""
+            if full_summary:
+                completed_payload["full_summary"] = full_summary[:1000]
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -5678,17 +5685,20 @@ def edit_completed_task_result(
             handoff_summary.strip().splitlines()[0][:400]
             if handoff_summary else ""
         )
+        edited_payload = {
+            "fields": (
+                ["result", "summary"]
+                + (["metadata"] if metadata is not None else [])
+            ),
+            "result_len": len(result) if result else 0,
+            "summary": ev_summary or None,
+        }
+        if row["observation"] and handoff_summary:
+            # Observation cards intentionally have no run row. Preserve the
+            # bounded full handoff in the audit event for latest_summary().
+            edited_payload["full_summary"] = handoff_summary[:1000]
         _append_event(
-            conn, task_id, "edited",
-            {
-                "fields": (
-                    ["result", "summary"]
-                    + (["metadata"] if metadata is not None else [])
-                ),
-                "result_len": len(result) if result else 0,
-                "summary": ev_summary or None,
-            },
-            run_id=run_id,
+            conn, task_id, "edited", edited_payload, run_id=run_id,
         )
     return True
 
@@ -10246,7 +10256,23 @@ def latest_summary(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
         "ORDER BY COALESCE(ended_at, started_at) DESC, id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return row["summary"] if row else None
+    if row:
+        return row["summary"]
+    event_rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('completed', 'edited') "
+        "AND payload IS NOT NULL ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    for event_row in event_rows:
+        try:
+            payload = json.loads(event_row["payload"])
+        except (TypeError, ValueError):
+            continue
+        full_summary = payload.get("full_summary") if isinstance(payload, dict) else None
+        if isinstance(full_summary, str) and full_summary:
+            return full_summary
+    return None
 
 
 def latest_summaries(
@@ -10282,4 +10308,27 @@ def latest_summaries(
         """,
         ids,
     ).fetchall()
-    return {r["task_id"]: r["summary"] for r in rows}
+    summaries = {r["task_id"]: r["summary"] for r in rows}
+    missing = [task_id for task_id in ids if task_id not in summaries]
+    if not missing:
+        return summaries
+    event_placeholders = ",".join("?" for _ in missing)
+    event_rows = conn.execute(
+        f"SELECT task_id, payload FROM task_events "
+        f"WHERE task_id IN ({event_placeholders}) "
+        "AND kind IN ('completed', 'edited') AND payload IS NOT NULL "
+        "ORDER BY id DESC",
+        missing,
+    ).fetchall()
+    for event_row in event_rows:
+        task_id = event_row["task_id"]
+        if task_id in summaries:
+            continue
+        try:
+            payload = json.loads(event_row["payload"])
+        except (TypeError, ValueError):
+            continue
+        full_summary = payload.get("full_summary") if isinstance(payload, dict) else None
+        if isinstance(full_summary, str) and full_summary:
+            summaries[task_id] = full_summary
+    return summaries
