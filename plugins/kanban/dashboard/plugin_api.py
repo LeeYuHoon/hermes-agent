@@ -176,7 +176,10 @@ def _parse_token_comment(body: Any, task_id: str) -> Optional[dict[str, Any]]:
         payload = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError):
         return None
-    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+    # Version 2 is the token-aware adapter contract. Continue accepting the
+    # short-lived version-1 token payloads emitted before the version bump so
+    # already-recorded usage does not disappear after upgrading.
+    if not isinstance(payload, dict) or payload.get("schema_version") not in {1, 2}:
         return None
     source = payload.get("source")
     if not isinstance(source, str) or _TOKEN_HEADERS.get(source) != header:
