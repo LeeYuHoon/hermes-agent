@@ -165,7 +165,11 @@ _TOKEN_FIELDS = ("input", "output", "cache_read", "cache_write", "reasoning", "r
 _TOKEN_LIMIT = 1_000_000_000_000_000
 
 
-def _parse_token_comment(body: Any, task_id: str) -> Optional[dict[str, Any]]:
+def _parse_token_comment(
+    body: Any,
+    task_id: str,
+    author: str,
+) -> Optional[dict[str, Any]]:
     """Parse one adapter-owned usage comment and validate provider totals."""
     if not isinstance(body, str):
         return None
@@ -183,6 +187,14 @@ def _parse_token_comment(body: Any, task_id: str) -> Optional[dict[str, Any]]:
         return None
     source = payload.get("source")
     if not isinstance(source, str) or _TOKEN_HEADERS.get(source) != header:
+        return None
+    # The repository-owned writers pin these authors explicitly:
+    # ``Backend.add_comment`` uses kanban-adapter, while
+    # ``TurnTracker._complete`` uses hermes-agent.
+    expected_author = (
+        "hermes-agent" if source == "hermes-agent" else "kanban-adapter"
+    )
+    if author != expected_author:
         return None
     event_id = payload.get("event_id")
     if not isinstance(event_id, str) or not _TOKEN_EVENT_RE.fullmatch(event_id):
@@ -244,6 +256,14 @@ def _reasoning_coverage(*, known: int, unknown: int, sources: set[str]) -> str:
     return "unavailable"
 
 
+def _bucket_coverage(known: int, total: int) -> str:
+    if known == 0:
+        return "unavailable"
+    if known == total:
+        return "complete"
+    return "partial"
+
+
 def _token_usage_rollup(
     conn: sqlite3.Connection,
     task_ids: list[str],
@@ -261,7 +281,7 @@ def _token_usage_rollup(
             task_slots = ",".join("?" for _ in chunk)
             header_slots = " OR ".join("body LIKE ?" for _ in header_patterns)
             rows.extend(conn.execute(
-                "SELECT id, task_id, body FROM task_comments "
+                "SELECT id, task_id, author, body FROM task_comments "
                 f"WHERE task_id IN ({task_slots}) AND ({header_slots})",
                 (*chunk, *header_patterns),
             ).fetchall())
@@ -269,7 +289,9 @@ def _token_usage_rollup(
             task_id = row["task_id"]
             if task_id not in selected:
                 continue
-            event = _parse_token_comment(row["body"], task_id)
+            event = _parse_token_comment(
+                row["body"], task_id, str(row["author"] or "")
+            )
             if event is None or event["event_id"] in seen_events:
                 continue
             seen_events.add(event["event_id"])
@@ -281,8 +303,11 @@ def _token_usage_rollup(
     board_unknown_reasoning = 0
     board_total = 0
     board_sources: set[str] = set()
+    board_known = {field: 0 for field in _TOKEN_FIELDS}
+    board_event_count = 0
     for task_id, events in events_by_task.items():
         sums = {field: 0 for field in _TOKEN_FIELDS}
+        known = {field: 0 for field in _TOKEN_FIELDS}
         known_reasoning = 0
         unknown_reasoning = 0
         task_total = 0
@@ -294,14 +319,16 @@ def _token_usage_rollup(
                 value = tokens.get(field)
                 if isinstance(value, int):
                     sums[field] += value
+                    known[field] += 1
             if isinstance(tokens.get("reasoning"), int):
                 known_reasoning += 1
             else:
                 unknown_reasoning += 1
             task_total += tokens["total"]
-        rendered_tokens: dict[str, Optional[int]] = dict(sums)
-        if not known_reasoning:
-            rendered_tokens["reasoning"] = None
+        rendered_tokens: dict[str, Optional[int]] = {
+            field: sums[field] if known[field] else None
+            for field in _TOKEN_FIELDS
+        }
         rendered_tokens["total"] = task_total
         per_task[task_id] = {
             "tokens": rendered_tokens,
@@ -310,17 +337,24 @@ def _token_usage_rollup(
             "reasoning_coverage": _reasoning_coverage(
                 known=known_reasoning, unknown=unknown_reasoning, sources=sources,
             ),
+            "bucket_coverage": {
+                field: _bucket_coverage(known[field], len(events))
+                for field in _TOKEN_FIELDS
+            },
         }
         for field in _TOKEN_FIELDS:
             board_sums[field] += sums[field]
+            board_known[field] += known[field]
+        board_event_count += len(events)
         board_known_reasoning += known_reasoning
         board_unknown_reasoning += unknown_reasoning
         board_total += task_total
         board_sources.update(sources)
 
-    board_tokens: dict[str, Optional[int]] = dict(board_sums)
-    if not board_known_reasoning:
-        board_tokens["reasoning"] = None
+    board_tokens: dict[str, Optional[int]] = {
+        field: board_sums[field] if board_known[field] else None
+        for field in _TOKEN_FIELDS
+    }
     board_tokens["total"] = board_total
     return per_task, {
         "tokens": board_tokens,
@@ -331,6 +365,10 @@ def _token_usage_rollup(
             unknown=board_unknown_reasoning,
             sources=board_sources,
         ),
+        "bucket_coverage": {
+            field: _bucket_coverage(board_known[field], board_event_count)
+            for field in _TOKEN_FIELDS
+        },
     }
 
 
@@ -638,7 +676,16 @@ def get_board(
         # preview here — the full text is available via /tasks/:id.
         task_ids = [t.id for t in tasks]
         summary_map = kanban_db.latest_summaries(conn, task_ids)
-        token_usage_by_task, board_token_usage = _token_usage_rollup(conn, task_ids)
+        all_task_ids = [
+            row["id"]
+            for row in conn.execute("SELECT id FROM tasks").fetchall()
+        ]
+        all_token_usage, board_token_usage = _token_usage_rollup(conn, all_task_ids)
+        token_usage_by_task = {
+            task_id: all_token_usage[task_id]
+            for task_id in task_ids
+            if task_id in all_token_usage
+        }
 
         for t in tasks:
             full = summary_map.get(t.id)
@@ -2300,39 +2347,24 @@ def _board_counts(slug: str) -> dict[str, int]:
         return {}
 
 
-def _board_token_usage(slug: str, *, include_archived: bool) -> dict[str, Any]:
-    """Return all-time usage for one board, excluding archived cards by default."""
+def _board_token_usage(slug: str) -> Optional[dict[str, Any]]:
+    """Return all-time usage for every card on one board."""
     try:
         path = kanban_db.kanban_db_path(board=slug)
         if not path.exists():
-            return {
-                "tokens": {
-                    "input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
-                    "reasoning": None, "requests": 0, "total": 0,
-                },
-                "tracked_tasks": 0,
-                "total_tasks": 0,
-                "reasoning_coverage": "unavailable",
-            }
+            return None
         conn = kanban_db.connect(board=slug)
         try:
-            where = "" if include_archived else " WHERE status != 'archived'"
             task_ids = [
-                row["id"] for row in conn.execute(f"SELECT id FROM tasks{where}").fetchall()
+                row["id"]
+                for row in conn.execute("SELECT id FROM tasks").fetchall()
             ]
             return _token_usage_rollup(conn, task_ids)[1]
         finally:
             conn.close()
     except Exception:
-        return {
-            "tokens": {
-                "input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
-                "reasoning": None, "requests": 0, "total": 0,
-            },
-            "tracked_tasks": 0,
-            "total_tasks": 0,
-            "reasoning_coverage": "unavailable",
-        }
+        log.exception("Failed to aggregate token usage for board %s", slug)
+        return None
 
 
 def _default_workspace_kind(board: dict[str, Any]) -> str:
@@ -2355,9 +2387,7 @@ def list_boards(include_archived: bool = Query(False)):
         b["is_current"] = (b["slug"] == current)
         b["counts"] = _board_counts(b["slug"])
         b["total"] = sum(b["counts"].values())
-        b["token_usage"] = _board_token_usage(
-            b["slug"], include_archived=include_archived,
-        )
+        b["token_usage"] = _board_token_usage(b["slug"])
         b["default_workspace_kind"] = _default_workspace_kind(b)
     return {"boards": boards, "current": current}
 

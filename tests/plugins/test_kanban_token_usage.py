@@ -65,12 +65,12 @@ def test_board_api_aggregates_unique_structured_token_comments(client) -> None:
             "reasoning": None, "requests": 2, "total": 88,
         })
         codex_body = _usage("codex", codex, {
-            "input": 7, "output": 11, "cache_read": 13, "cache_write": 0,
+            "input": 7, "output": 11, "cache_read": 13, "cache_write": None,
             "reasoning": 5, "requests": 1, "total": 31,
         })
-        kb.add_comment(conn, claude, "claude-code", claude_body)
-        kb.add_comment(conn, claude, "retry", claude_body)
-        kb.add_comment(conn, codex, "codex", codex_body)
+        kb.add_comment(conn, claude, "kanban-adapter", claude_body)
+        kb.add_comment(conn, claude, "kanban-adapter", claude_body)
+        kb.add_comment(conn, codex, "kanban-adapter", codex_body)
         kb.add_comment(conn, codex, "user", "Codex tool usage\n" + json.dumps({
             "schema_version": 1,
             "source": "codex",
@@ -97,6 +97,14 @@ def test_board_api_aggregates_unique_structured_token_comments(client) -> None:
         "tracked_tasks": 2,
         "total_tasks": 3,
         "reasoning_coverage": "partial",
+        "bucket_coverage": {
+            "input": "complete",
+            "output": "complete",
+            "cache_read": "complete",
+            "cache_write": "partial",
+            "reasoning": "partial",
+            "requests": "complete",
+        },
     }
     tasks = {
         task["title"]: task
@@ -107,6 +115,8 @@ def test_board_api_aggregates_unique_structured_token_comments(client) -> None:
     assert tasks["claude"]["token_usage"]["tokens"]["reasoning"] is None
     assert tasks["claude"]["token_usage"]["source"] == "claude-code"
     assert tasks["codex"]["token_usage"]["tokens"]["reasoning"] == 5
+    assert tasks["codex"]["token_usage"]["tokens"]["cache_write"] is None
+    assert tasks["codex"]["token_usage"]["bucket_coverage"]["cache_write"] == "unavailable"
     assert tasks["old card"]["token_usage"] is None
 
     detail = client.get(f"/api/plugins/kanban/tasks/{claude}").json()
@@ -114,7 +124,64 @@ def test_board_api_aggregates_unique_structured_token_comments(client) -> None:
     assert detail["task"]["token_usage"]["reasoning_coverage"] == "output_included"
 
 
-def test_boards_api_exposes_each_board_token_total(client) -> None:
+def test_board_token_total_is_board_wide_when_cards_are_filtered(client) -> None:
+    conn = kb.connect()
+    try:
+        visible = kb.create_task(conn, title="visible", tenant="alpha")
+        filtered = kb.create_task(conn, title="filtered", tenant="beta")
+        archived = kb.create_task(conn, title="archived", tenant="alpha")
+        kb.archive_task(conn, archived)
+        kb.add_comment(conn, visible, "kanban-adapter", _usage(
+            "codex", visible, {"input": 10, "output": 1, "total": 11},
+        ))
+        kb.add_comment(conn, filtered, "kanban-adapter", _usage(
+            "codex", filtered, {"input": 20, "output": 2, "total": 22},
+        ))
+        kb.add_comment(conn, archived, "kanban-adapter", _usage(
+            "codex", archived, {"input": 40, "output": 4, "total": 44},
+        ))
+    finally:
+        conn.close()
+
+    payload = client.get(
+        "/api/plugins/kanban/board?tenant=alpha&include_archived=true"
+    ).json()
+    rendered = {
+        task["title"]
+        for column in payload["columns"]
+        for task in column["tasks"]
+    }
+    assert rendered == {"visible", "archived"}
+    assert payload["token_usage"]["tokens"]["total"] == 77
+    assert payload["token_usage"]["tracked_tasks"] == 3
+    assert payload["token_usage"]["total_tasks"] == 3
+
+
+def test_user_comment_cannot_shadow_adapter_token_usage(client) -> None:
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="trusted")
+        kb.add_comment(conn, task_id, "user", _usage(
+            "codex", task_id, {"input": 999, "output": 1, "total": 1_000},
+        ))
+        kb.add_comment(conn, task_id, "kanban-adapter", _usage(
+            "codex", task_id, {"input": 7, "output": 3, "total": 10},
+        ))
+    finally:
+        conn.close()
+
+    payload = client.get("/api/plugins/kanban/board").json()
+    assert payload["token_usage"]["tokens"]["total"] == 10
+    task = next(
+        task
+        for column in payload["columns"]
+        for task in column["tasks"]
+        if task["title"] == "trusted"
+    )
+    assert task["token_usage"]["tokens"]["total"] == 10
+
+
+def test_hermes_agent_authored_usage_is_counted_in_board_total(client) -> None:
     conn = kb.connect()
     try:
         task_id = kb.create_task(conn, title="hermes")
@@ -135,6 +202,31 @@ def test_boards_api_exposes_each_board_token_total(client) -> None:
     assert board["token_usage"]["tracked_tasks"] == 1
 
 
+def test_boards_include_archived_only_controls_board_visibility(client) -> None:
+    conn = kb.connect()
+    try:
+        active = kb.create_task(conn, title="active")
+        archived = kb.create_task(conn, title="archived")
+        kb.archive_task(conn, archived)
+        kb.add_comment(conn, active, "kanban-adapter", _usage(
+            "codex", active, {"input": 5, "output": 1, "total": 6},
+        ))
+        kb.add_comment(conn, archived, "kanban-adapter", _usage(
+            "codex", archived, {"input": 50, "output": 10, "total": 60},
+        ))
+    finally:
+        conn.close()
+
+    board = next(
+        item for item in client.get(
+            "/api/plugins/kanban/boards?include_archived=true"
+        ).json()["boards"] if item["slug"] == "default"
+    )
+    assert board["token_usage"]["tokens"]["total"] == 66
+    assert board["token_usage"]["total_tasks"] == 2
+    assert board["total"] == 2
+
+
 def test_dashboard_renders_board_card_and_detail_token_usage() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
@@ -147,5 +239,6 @@ def test_dashboard_renders_board_card_and_detail_token_usage() -> None:
     assert "reasoningIncludedInOutput" in js
     assert "Provider-reported total" in js
     assert "tracked_tasks" in js
+    assert "b.token_usage && b.token_usage.tracked_tasks > 0" in js
     assert ".hermes-kanban-token-summary" in css
     assert ".hermes-kanban-token-grid" in css

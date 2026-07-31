@@ -270,19 +270,32 @@
     return formatTokenCount(value, false, i18n) + suffix;
   }
 
+  function tokenBucketLabel(usage, fields, value, compact, i18n) {
+    const coverage = usage && usage.bucket_coverage ? usage.bucket_coverage : {};
+    const states = fields.map(function (field) { return coverage[field]; });
+    const partial = states.indexOf("partial") >= 0
+      || (states.indexOf("complete") >= 0 && states.indexOf("unavailable") >= 0);
+    return formatTokenCount(value, compact, i18n)
+      + (partial ? tx(i18n, "tokenPartialSuffix", " (partial)") : "");
+  }
+
   function TokenBoardSummary(props) {
     const { t: i18n } = useI18n();
     const usage = props.usage;
     if (!usage) return null;
     const tokens = usage.tokens || {};
-    const cache = (typeof tokens.cache_read === "number" ? tokens.cache_read : 0)
-      + (typeof tokens.cache_write === "number" ? tokens.cache_write : 0);
+    const hasCache = typeof tokens.cache_read === "number"
+      || typeof tokens.cache_write === "number";
+    const cache = hasCache
+      ? (typeof tokens.cache_read === "number" ? tokens.cache_read : 0)
+        + (typeof tokens.cache_write === "number" ? tokens.cache_write : 0)
+      : null;
     const fields = [
       [tx(i18n, "tokenTotal", "Total"), formatTokenCount(tokens.total, true, i18n),
         tx(i18n, "tokenTotalHint", "Provider-reported total; provider semantics may differ from the displayed buckets.")],
-      [tx(i18n, "tokenInput", "Input"), formatTokenCount(tokens.input, true, i18n)],
-      [tx(i18n, "tokenCache", "Cache"), formatTokenCount(cache, true, i18n)],
-      [tx(i18n, "tokenOutput", "Output"), formatTokenCount(tokens.output, true, i18n)],
+      [tx(i18n, "tokenInput", "Input"), tokenBucketLabel(usage, ["input"], tokens.input, true, i18n)],
+      [tx(i18n, "tokenCache", "Cache"), tokenBucketLabel(usage, ["cache_read", "cache_write"], cache, true, i18n)],
+      [tx(i18n, "tokenOutput", "Output"), tokenBucketLabel(usage, ["output"], tokens.output, true, i18n)],
       [tx(i18n, "tokenReasoning", "Reasoning"), reasoningTokenLabel(usage, i18n)],
     ];
     return h("section", {
@@ -321,12 +334,12 @@
     const rows = [
       [tx(i18n, "tokenTotal", "Total"), formatTokenCount(tokens.total, false, i18n),
         tx(i18n, "tokenTotalHint", "Provider-reported total; provider semantics may differ from the displayed buckets.")],
-      [tx(i18n, "tokenInput", "Input"), formatTokenCount(tokens.input, false, i18n)],
-      [tx(i18n, "tokenCacheRead", "Cache read"), formatTokenCount(tokens.cache_read, false, i18n)],
-      [tx(i18n, "tokenCacheWrite", "Cache write"), formatTokenCount(tokens.cache_write, false, i18n)],
-      [tx(i18n, "tokenOutput", "Output"), formatTokenCount(tokens.output, false, i18n)],
+      [tx(i18n, "tokenInput", "Input"), tokenBucketLabel(usage, ["input"], tokens.input, false, i18n)],
+      [tx(i18n, "tokenCacheRead", "Cache read"), tokenBucketLabel(usage, ["cache_read"], tokens.cache_read, false, i18n)],
+      [tx(i18n, "tokenCacheWrite", "Cache write"), tokenBucketLabel(usage, ["cache_write"], tokens.cache_write, false, i18n)],
+      [tx(i18n, "tokenOutput", "Output"), tokenBucketLabel(usage, ["output"], tokens.output, false, i18n)],
       [tx(i18n, "tokenReasoning", "Reasoning"), reasoningTokenLabel(usage, i18n)],
-      [tx(i18n, "tokenRequests", "Requests"), formatTokenCount(tokens.requests, false, i18n)],
+      [tx(i18n, "tokenRequests", "Requests"), tokenBucketLabel(usage, ["requests"], tokens.requests, false, i18n)],
     ];
     return h("div", { className: "hermes-kanban-section hermes-kanban-token-detail" },
       h("div", { className: "hermes-kanban-section-head" },
