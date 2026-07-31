@@ -3683,11 +3683,16 @@
   function TaskDetail(props) {
     const { t: i18n } = useI18n();
     const t = props.data.task;
+    const [showFullResult, setShowFullResult] = useState(false);
     const comments = props.data.comments || [];
     const events = props.data.events || [];
     const attachments = props.data.attachments || [];
     const links = props.data.links || { parents: [], children: [] };
     const childResults = props.data.child_results || [];
+
+    useEffect(function () {
+      setShowFullResult(false);
+    }, [t.id]);
 
     return h("div", { className: "hermes-kanban-drawer-body" },
       h("div", { className: "hermes-kanban-drawer-title" },
@@ -3761,16 +3766,51 @@
         onRemoveChild: props.onRemoveChild,
       }),
       (function () {
-        var finalResult = t.result || t.latest_summary || null;
+        var resultSummary = t.latest_summary || t.result || null;
+        var fullResult = t.result || null;
+        var hasFullResult = Boolean(
+          t.latest_summary && fullResult && fullResult !== resultSummary
+        );
         var isDone = t.status === "done";
         var isParent = links.children.length > 0;
-        if (finalResult) {
-          var label = t.result
-            ? tx(i18n, "result", "Result")
-            : tx(i18n, "finalResult", "Final Result (run summary)");
+        if (resultSummary) {
+          var label = t.latest_summary
+            ? (hasFullResult
+                ? tx(i18n, "resultSummary", "Result summary")
+                : tx(i18n, "finalResult", "Final Result (run summary)"))
+            : tx(i18n, "result", "Result");
+          var summaryContent = hasFullResult
+            ? h("button", {
+                type: "button",
+                className: "hermes-kanban-result-summary",
+                "aria-expanded": showFullResult,
+                "aria-controls": "hermes-kanban-full-result-" + t.id,
+                onClick: function () {
+                  setShowFullResult(function (open) { return !open; });
+                },
+              },
+                h("span", { className: "hermes-kanban-result-summary-text" }, resultSummary),
+                h("span", { className: "hermes-kanban-result-toggle" },
+                  showFullResult
+                    ? tx(i18n, "hideFullResult", "Hide full result")
+                    : tx(i18n, "showFullResult", "Show full result"),
+                ),
+              )
+            : h(MarkdownBlock, { source: resultSummary, enabled: props.renderMarkdown });
           return h("div", { className: "hermes-kanban-section" },
             h("div", { className: "hermes-kanban-section-head" }, label),
-            h(MarkdownBlock, { source: finalResult, enabled: props.renderMarkdown }),
+            summaryContent,
+            hasFullResult && showFullResult
+              ? h("div", {
+                  id: "hermes-kanban-full-result-" + t.id,
+                  className: "hermes-kanban-full-result",
+                },
+                  h("div", { className: "hermes-kanban-section-head" },
+                    tx(i18n, "fullResult", "Full result"),
+                  ),
+                  h(MarkdownBlock, { source: fullResult, enabled: props.renderMarkdown }),
+                )
+              : null,
           );
         }
         if (isDone && isParent) {
