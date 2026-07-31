@@ -45,7 +45,7 @@ def _usage(source: str, task_id: str, tokens: dict) -> str:
         "hermes-agent": "Hermes Agent tool usage",
     }
     return headers[source] + "\n" + json.dumps({
-        "schema_version": 1,
+        "schema_version": 2,
         "source": source,
         "event_id": "usage-" + hashlib.sha256(
             f"{source}\0{task_id}".encode("utf-8")
