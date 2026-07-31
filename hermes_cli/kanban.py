@@ -605,7 +605,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete = sub.add_parser("complete", help="Mark one or more tasks done")
     p_complete.add_argument("task_ids", nargs="+",
                             help="One or more task ids (only --result applies to all of them)")
-    p_complete.add_argument("--result", default=None, help="Result summary")
+    result_source = p_complete.add_mutually_exclusive_group()
+    result_source.add_argument("--result", default=None, help="Complete result text")
+    result_source.add_argument(
+        "--result-file", default=None,
+        help="UTF-8 file containing the complete result (avoids command-line size limits)",
+    )
     p_complete.add_argument("--summary", default=None,
                             help="Structured handoff summary for downstream tasks. "
                                  "Falls back to --result if omitted.")
@@ -2180,6 +2185,14 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         print("at least one task_id is required", file=sys.stderr)
         return 1
     summary = getattr(args, "summary", None)
+    result = getattr(args, "result", None)
+    result_file = getattr(args, "result_file", None)
+    if result_file:
+        try:
+            result = Path(result_file).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            print(f"kanban: --result-file: {exc}", file=sys.stderr)
+            return 2
     raw_meta = getattr(args, "metadata", None)
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
@@ -2230,7 +2243,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                         # silently disabling the gate.
                         verdict, reason, _, _, _ = judge_goal(
                             goal=f"{task.title}\n\n{task.body or ''}".strip(),
-                            last_response=(summary or args.result or "").strip(),
+                            last_response=(summary or result or "").strip(),
                         )
                     except Exception as judge_exc:
                         import logging as _logging
@@ -2250,7 +2263,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
 
             if not kb.complete_task(
                 conn, tid,
-                result=args.result,
+                result=result,
                 summary=summary,
                 metadata=metadata,
                 expected_run_id=_worker_run_id_for(tid),

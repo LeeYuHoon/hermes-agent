@@ -574,6 +574,50 @@
   color: var(--color-muted-foreground);
 }
 
+.hermes-kanban-result-summary {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.55rem;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 0.25rem);
+  background: color-mix(in srgb, var(--color-foreground) 4%, transparent);
+  color: var(--color-foreground);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.hermes-kanban-result-summary:hover,
+.hermes-kanban-result-summary:focus-visible {
+  border-color: color-mix(in srgb, var(--color-ring) 65%, var(--color-border));
+  background: color-mix(in srgb, var(--color-ring) 8%, transparent);
+  outline: 2px solid var(--color-ring);
+  outline-offset: 2px;
+}
+
+.hermes-kanban-result-summary-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+
+.hermes-kanban-result-toggle {
+  color: var(--color-ring);
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+
+.hermes-kanban-full-result {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding-top: 0.4rem;
+  border-top: 1px solid var(--color-border);
+}
+
 .hermes-kanban-pre {
   margin: 0;
   padding: 0.5rem 0.6rem;

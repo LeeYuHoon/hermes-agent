@@ -2518,14 +2518,23 @@ def test_board_tasks_include_latest_summary(client):
     assert "Done: see attachment" in card["latest_summary"]
 
 
-def test_dashboard_done_final_result_section_rendered_from_summary():
-    """Frontend must render Final Result section from run summary when task.result is empty."""
+def test_dashboard_result_summary_expands_the_distinct_full_result():
+    """The concise summary is primary and reveals the complete result on click."""
     repo_root = Path(__file__).resolve().parents[2]
     dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
-    assert "t.result || t.latest_summary" in dist
+    css = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css").read_text()
+
+    assert "var resultSummary = t.latest_summary || t.result || null;" in dist
+    assert "var fullResult = t.result || null;" in dist
+    assert "var hasFullResult" in dist
+    assert '"aria-expanded": showFullResult' in dist
+    assert "setShowFullResult(function (open) { return !open; })" in dist
+    assert "Full result" in dist
+    assert "hermes-kanban-result-summary" in css
+    assert "hermes-kanban-full-result" in css
+    assert "outline: 2px solid var(--color-ring);" in css
     assert "Final Result (run summary)" in dist
     assert "No final result was recorded" in dist
-    assert "orchestrator" in dist or "parent task" in dist
 
 
 def test_task_detail_includes_child_result_summaries(client):
@@ -2558,7 +2567,8 @@ def test_dashboard_final_result_uses_existing_fields_without_alias():
     dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
     api = (repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py").read_text()
 
-    assert "var finalResult = t.result || t.latest_summary || null;" in dist
+    assert "var resultSummary = t.latest_summary || t.result || null;" in dist
+    assert "var fullResult = t.result || null;" in dist
     assert "t.final_result" not in dist
     assert 'd["final_result"]' not in api
 

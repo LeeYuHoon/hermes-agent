@@ -24,6 +24,25 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
+def test_complete_reads_untruncated_result_from_file(kanban_home, tmp_path):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="large result")
+    full_result = "원문\n" + "x" * 1_200_000
+    result_file = tmp_path / "result.txt"
+    result_file.write_text(full_result, encoding="utf-8")
+    args = argparse.Namespace(
+        task_ids=[task_id], result=None, result_file=str(result_file),
+        summary="완료 요약", metadata=None,
+    )
+
+    assert kc._cmd_complete(args) == 0
+
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.result == full_result
+
+
 # ---------------------------------------------------------------------------
 # Workspace flag parsing
 # ---------------------------------------------------------------------------
